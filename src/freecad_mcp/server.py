@@ -22,6 +22,10 @@ class FreeCADConnection:
     def __init__(self, host: str = "localhost", port: int = 9875):
         self.server = xmlrpc.client.ServerProxy(f"http://{host}:{port}", allow_none=True)
 
+    def disconnect(self):
+        """Clean up the connection (no-op for XML-RPC)."""
+        pass
+
     def ping(self) -> bool:
         return self.server.ping()
 
@@ -45,39 +49,22 @@ class FreeCADConnection:
 
     def get_active_screenshot(self, view_name: str = "Isometric", width: int | None = None, height: int | None = None, focus_object: str | None = None) -> str | None:
         try:
-            # Check if we're in a view that supports screenshots
-            result = self.server.execute_code("""
-import FreeCAD
-import FreeCADGui
-
-if FreeCAD.Gui.ActiveDocument and FreeCAD.Gui.ActiveDocument.ActiveView:
-    view_type = type(FreeCAD.Gui.ActiveDocument.ActiveView).__name__
-    
-    # These view types don't support screenshots
-    unsupported_views = ['SpreadsheetGui::SheetView', 'DrawingGui::DrawingView', 'TechDrawGui::MDIViewPage']
-    
-    if view_type in unsupported_views or not hasattr(FreeCAD.Gui.ActiveDocument.ActiveView, 'saveImage'):
-        print("Current view does not support screenshots")
-        False
-    else:
-        print(f"Current view supports screenshots: {view_type}")
-        True
-else:
-    print("No active view")
-    False
-""")
-
-            # If the view doesn't support screenshots, return None
-            if not result.get("success", False) or "Current view does not support screenshots" in result.get("message", ""):
-                logger.info("Screenshot unavailable in current view (likely Spreadsheet or TechDraw view)")
-                return None
-
-            # Otherwise, try to get the screenshot
-            return self.server.get_active_screenshot(view_name, width, height, focus_object)
+            # The addon RPC server already checks view compatibility
+            # and returns None if screenshots aren't supported
+            result = self.server.get_active_screenshot(view_name, width, height, focus_object)
+            return result if result else None
         except Exception as e:
-            # Log the error but return None instead of raising an exception
             logger.error(f"Error getting screenshot: {e}")
             return None
+
+    def save_document(self, doc_name: str, file_path: str = "") -> dict[str, Any]:
+        return self.server.save_document(doc_name, file_path)
+
+    def export_document(self, doc_name: str, obj_names: list[str], file_path: str, file_format: str) -> dict[str, Any]:
+        return self.server.export_document(doc_name, obj_names, file_path, file_format)
+
+    def recompute_document(self, doc_name: str) -> dict[str, Any]:
+        return self.server.recompute_document(doc_name)
 
     def get_objects(self, doc_name: str) -> list[dict[str, Any]]:
         return self.server.get_objects(doc_name)
@@ -87,6 +74,9 @@ else:
 
     def get_parts_list(self) -> list[str]:
         return self.server.get_parts_list()
+
+    def inspect_geometry(self, doc_name: str, obj_name: str, what: str = "summary") -> dict[str, Any]:
+        return self.server.inspect_geometry(doc_name, obj_name, what)
 
     def list_documents(self) -> list[str]:
         return self.server.list_documents()
@@ -140,15 +130,21 @@ def get_freecad_connection():
 
 
 # Helper function to safely add screenshot to response
-def add_screenshot_if_available(response, screenshot):
-    """Safely add screenshot to response only if it's available"""
-    if screenshot is not None and not _only_text_feedback:
+def add_screenshot_if_available(response, screenshot, force_include=False):
+    """Safely add screenshot to response only if it's available.
+
+    Args:
+        response: The response list to append to.
+        screenshot: Base64-encoded screenshot or None.
+        force_include: If True, include screenshot even when _only_text_feedback is set.
+    """
+    should_include = force_include or not _only_text_feedback
+    if screenshot is not None and should_include:
         response.append(ImageContent(type="image", data=screenshot, mimeType="image/png"))
-    elif not _only_text_feedback:
-        # Add an informative message that will be seen by the AI model and user
+    elif should_include and screenshot is None:
         response.append(TextContent(
-            type="text", 
-            text="Note: Visual preview is unavailable in the current view type (such as TechDraw or Spreadsheet). "
+            type="text",
+            text="Note: Visual preview is unavailable in the current view type. "
                  "Switch to a 3D view to see visual feedback."
         ))
     return response
@@ -200,125 +196,30 @@ def create_object(
     obj_properties: dict[str, Any] = None,
 ) -> list[TextContent | ImageContent]:
     """Create a new object in FreeCAD.
-    Object type is starts with "Part::" or "Draft::" or "PartDesign::" or "Fem::".
+    Object types start with "Part::", "Draft::", "PartDesign::", or "Fem::".
 
     Args:
         doc_name: The name of the document to create the object in.
-        obj_type: The type of the object to create (e.g. 'Part::Box', 'Part::Cylinder', 'Draft::Circle', 'PartDesign::Body', etc.).
+        obj_type: The type of the object to create.
         obj_name: The name of the object to create.
+        analysis_name: Optional FEM analysis name to add the object to.
         obj_properties: The properties of the object to create.
 
     Returns:
-        A message indicating the success or failure of the object creation and a screenshot of the object.
+        A message indicating the success or failure of the object creation.
 
-    Examples:
-        If you want to create a cylinder with a height of 30 and a radius of 10, you can use the following data.
-        ```json
-        {
-            "doc_name": "MyCylinder",
-            "obj_name": "Cylinder",
-            "obj_type": "Part::Cylinder",
-            "obj_properties": {
-                "Height": 30,
-                "Radius": 10,
-                "Placement": {
-                    "Base": {
-                        "x": 10,
-                        "y": 10,
-                        "z": 0
-                    },
-                    "Rotation": {
-                        "Axis": {
-                            "x": 0,
-                            "y": 0,
-                            "z": 1
-                        },
-                        "Angle": 45
-                    }
-                },
-                "ViewObject": {
-                    "ShapeColor": [0.5, 0.5, 0.5, 1.0]
-                }
-            }
-        }
-        ```
+    Common types: Part::Box, Part::Cylinder, Part::Sphere, Part::Cone, Part::Torus,
+    PartDesign::Body, Draft::Circle, Draft::Wire, Fem::AnalysisPython, Fem::FemMeshGmsh.
 
-        If you want to create a circle with a radius of 10, you can use the following data.
-        ```json
-        {
-            "doc_name": "MyCircle",
-            "obj_name": "Circle",
-            "obj_type": "Draft::Circle",
-        }
-        ```
-
-        If you want to create a FEM analysis, you can use the following data.
-        ```json
-        {
-            "doc_name": "MyFEMAnalysis",
-            "obj_name": "FemAnalysis",
-            "obj_type": "Fem::AnalysisPython",
-        }
-        ```
-
-        If you want to create a FEM constraint, you can use the following data.
-        ```json
-        {
-            "doc_name": "MyFEMConstraint",
-            "obj_name": "FemConstraint",
-            "obj_type": "Fem::ConstraintFixed",
-            "analysis_name": "MyFEMAnalysis",
-            "obj_properties": {
-                "References": [
-                    {
-                        "object_name": "MyObject",
-                        "face": "Face1"
-                    }
-                ]
-            }
-        }
-        ```
-
-        If you want to create a FEM mechanical material, you can use the following data.
-        ```json
-        {
-            "doc_name": "MyFEMAnalysis",
-            "obj_name": "FemMechanicalMaterial",
-            "obj_type": "Fem::MaterialCommon",
-            "analysis_name": "MyFEMAnalysis",
-            "obj_properties": {
-                "Material": {
-                    "Name": "MyMaterial",
-                    "Density": "7900 kg/m^3",
-                    "YoungModulus": "210 GPa",
-                    "PoissonRatio": 0.3
-                }
-            }
-        }
-        ```
-
-        If you want to create a FEM mesh, you can use the following data.
-        The `Part` property is required.
-        ```json
-        {
-            "doc_name": "MyFEMMesh",
-            "obj_name": "FemMesh",
-            "obj_type": "Fem::FemMeshGmsh",
-            "analysis_name": "MyFEMAnalysis",
-            "obj_properties": {
-                "Part": "MyObject",
-                "ElementSizeMax": 10,
-                "ElementSizeMin": 0.1,
-                "MeshAlgorithm": 2
-            }
-        }
-        ```
+    Properties support Placement (Base + Rotation), ViewObject (ShapeColor), and
+    object references (Base, Tool, Source, Profile as string names, References as
+    list of [object_name, face] pairs). For FEM mesh, 'Part' property is required.
     """
     freecad = get_freecad_connection()
     try:
         obj_data = {"Name": obj_name, "Type": obj_type, "Properties": obj_properties or {}, "Analysis": analysis_name}
         res = freecad.create_object(doc_name, obj_data)
-        screenshot = freecad.get_active_screenshot()
+        screenshot = freecad.get_active_screenshot() if not _only_text_feedback else None
         
         if res["success"]:
             response = [
@@ -355,7 +256,7 @@ def edit_object(
     freecad = get_freecad_connection()
     try:
         res = freecad.edit_object(doc_name, obj_name, {"Properties": obj_properties})
-        screenshot = freecad.get_active_screenshot()
+        screenshot = freecad.get_active_screenshot() if not _only_text_feedback else None
 
         if res["success"]:
             response = [
@@ -388,7 +289,7 @@ def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextConten
     freecad = get_freecad_connection()
     try:
         res = freecad.delete_object(doc_name, obj_name)
-        screenshot = freecad.get_active_screenshot()
+        screenshot = freecad.get_active_screenshot() if not _only_text_feedback else None
         
         if res["success"]:
             response = [
@@ -408,30 +309,31 @@ def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextConten
 
 
 @mcp.tool()
-def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
+def execute_code(ctx: Context, code: str, include_screenshot: bool = False) -> list[TextContent | ImageContent]:
     """Execute arbitrary Python code in FreeCAD.
 
     Args:
         code: The Python code to execute.
+        include_screenshot: If True, include a screenshot in the response even when text-only mode is enabled.
 
     Returns:
-        A message indicating the success or failure of the code execution, the output of the code execution, and a screenshot of the object.
+        A message indicating the success or failure of the code execution and its output.
     """
     freecad = get_freecad_connection()
     try:
         res = freecad.execute_code(code)
-        screenshot = freecad.get_active_screenshot()
-        
+        screenshot = freecad.get_active_screenshot() if (include_screenshot or not _only_text_feedback) else None
+
         if res["success"]:
             response = [
                 TextContent(type="text", text=f"Code executed successfully: {res['message']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, force_include=include_screenshot)
         else:
             response = [
                 TextContent(type="text", text=f"Failed to execute code: {res['error']}"),
             ]
-            return add_screenshot_if_available(response, screenshot)
+            return add_screenshot_if_available(response, screenshot, force_include=include_screenshot)
     except Exception as e:
         logger.error(f"Failed to execute code: {str(e)}")
         return [
@@ -484,7 +386,7 @@ def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextConte
     freecad = get_freecad_connection()
     try:
         res = freecad.insert_part_from_library(relative_path)
-        screenshot = freecad.get_active_screenshot()
+        screenshot = freecad.get_active_screenshot() if not _only_text_feedback else None
         
         if res["success"]:
             response = [
@@ -504,21 +406,33 @@ def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextConte
 
 
 @mcp.tool()
-def get_objects(ctx: Context, doc_name: str) -> list[TextContent | ImageContent]:
+def get_objects(ctx: Context, doc_name: str, summary: bool = True) -> list[TextContent | ImageContent]:
     """Get all objects in a document.
-    You can use this tool to get the objects in a document to see what you can check or edit.
 
     Args:
         doc_name: The name of the document to get the objects from.
+        summary: If True (default), return only Name, Label, TypeId and Placement for each object.
+                 If False, return full object details including all properties and shape info.
 
     Returns:
-        A list of objects in the document and a screenshot of the document.
+        A list of objects in the document.
     """
     freecad = get_freecad_connection()
     try:
-        screenshot = freecad.get_active_screenshot()
+        objects = freecad.get_objects(doc_name)
+        if summary:
+            objects = [
+                {
+                    "Name": obj.get("Name"),
+                    "Label": obj.get("Label"),
+                    "TypeId": obj.get("TypeId"),
+                    "Placement": obj.get("Placement"),
+                }
+                for obj in objects
+            ]
+        screenshot = freecad.get_active_screenshot() if not _only_text_feedback else None
         response = [
-            TextContent(type="text", text=json.dumps(freecad.get_objects(doc_name))),
+            TextContent(type="text", text=json.dumps(objects)),
         ]
         return add_screenshot_if_available(response, screenshot)
     except Exception as e:
@@ -530,19 +444,18 @@ def get_objects(ctx: Context, doc_name: str) -> list[TextContent | ImageContent]
 
 @mcp.tool()
 def get_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent | ImageContent]:
-    """Get an object from a document.
-    You can use this tool to get the properties of an object to see what you can check or edit.
+    """Get an object from a document with all its properties.
 
     Args:
         doc_name: The name of the document to get the object from.
         obj_name: The name of the object to get.
 
     Returns:
-        The object and a screenshot of the object.
+        The object's full property data.
     """
     freecad = get_freecad_connection()
     try:
-        screenshot = freecad.get_active_screenshot()
+        screenshot = freecad.get_active_screenshot() if not _only_text_feedback else None
         response = [
             TextContent(type="text", text=json.dumps(freecad.get_object(doc_name, obj_name))),
         ]
@@ -552,6 +465,119 @@ def get_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent |
         return [
             TextContent(type="text", text=f"Failed to get object: {str(e)}")
         ]
+
+
+@mcp.tool()
+def save_document(ctx: Context, doc_name: str, file_path: str = "") -> list[TextContent]:
+    """Save a FreeCAD document.
+
+    Args:
+        doc_name: The name of the document to save.
+        file_path: Optional file path to save to. If empty, saves to the existing file path.
+
+    Returns:
+        A message indicating the success or failure of the save operation.
+    """
+    freecad = get_freecad_connection()
+    try:
+        res = freecad.save_document(doc_name, file_path)
+        if res["success"]:
+            return [TextContent(type="text", text=f"Document '{doc_name}' saved to {res['file_path']}")]
+        else:
+            return [TextContent(type="text", text=f"Failed to save document: {res['error']}")]
+    except Exception as e:
+        logger.error(f"Failed to save document: {str(e)}")
+        return [TextContent(type="text", text=f"Failed to save document: {str(e)}")]
+
+
+@mcp.tool()
+def export_objects(
+    ctx: Context,
+    doc_name: str,
+    obj_names: list[str],
+    file_path: str,
+    file_format: str,
+) -> list[TextContent]:
+    """Export objects from a FreeCAD document to STEP, STL, or IGES format.
+
+    Args:
+        doc_name: The name of the document containing the objects.
+        obj_names: List of object names to export.
+        file_path: The file path to export to (e.g. '/tmp/part.step').
+        file_format: The export format: 'STEP', 'STL', or 'IGES'.
+
+    Returns:
+        A message indicating the success or failure of the export.
+    """
+    freecad = get_freecad_connection()
+    try:
+        res = freecad.export_document(doc_name, obj_names, file_path, file_format)
+        if res["success"]:
+            return [TextContent(type="text", text=f"Exported to {res['file_path']}")]
+        else:
+            return [TextContent(type="text", text=f"Failed to export: {res['error']}")]
+    except Exception as e:
+        logger.error(f"Failed to export: {str(e)}")
+        return [TextContent(type="text", text=f"Failed to export: {str(e)}")]
+
+
+@mcp.tool()
+def recompute(ctx: Context, doc_name: str) -> list[TextContent]:
+    """Force recompute of a FreeCAD document.
+
+    Args:
+        doc_name: The name of the document to recompute.
+
+    Returns:
+        A message indicating the success or failure of the recompute.
+    """
+    freecad = get_freecad_connection()
+    try:
+        res = freecad.recompute_document(doc_name)
+        if res["success"]:
+            return [TextContent(type="text", text=f"Document '{doc_name}' recomputed successfully")]
+        else:
+            return [TextContent(type="text", text=f"Failed to recompute: {res['error']}")]
+    except Exception as e:
+        logger.error(f"Failed to recompute: {str(e)}")
+        return [TextContent(type="text", text=f"Failed to recompute: {str(e)}")]
+
+
+@mcp.tool()
+def inspect_geometry(
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    what: Literal["summary", "faces", "edges", "sketches", "feature_tree", "all"] = "summary",
+) -> list[TextContent]:
+    """Inspect structured geometry data from a FreeCAD object. Returns precise numeric data
+    (bounding box, face normals, edge lengths, sketch geometry, feature tree) for verification
+    without the token cost of a screenshot.
+
+    Args:
+        doc_name: The name of the document.
+        obj_name: The name of the object to inspect.
+        what: What data to return:
+            - "summary" (default): bounding box, volume, area, face/edge/vertex counts, validity
+            - "faces": per-face center, normal, area, surface type
+            - "edges": per-edge midpoint, length, curve type
+            - "sketches": sketch geometry, constraints, placement (obj must be a sketch)
+            - "feature_tree": feature list with validity and key properties (obj should be a Body)
+            - "all": everything above combined
+
+    Returns:
+        Structured geometry data as JSON text.
+    """
+    freecad = get_freecad_connection()
+    try:
+        res = freecad.inspect_geometry(doc_name, obj_name, what)
+        if res["success"]:
+            return [TextContent(type="text", text=json.dumps(res["data"], indent=2))]
+        else:
+            return [TextContent(type="text", text=f"Failed to inspect geometry: {res['error']}")]
+    except Exception as e:
+        logger.error(f"Failed to inspect geometry: {str(e)}")
+        return [TextContent(type="text", text=f"Failed to inspect geometry: {str(e)}")]
 
 
 @mcp.tool()

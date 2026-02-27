@@ -282,18 +282,21 @@ class FreeCADRPC:
             return {"success": False, "error": res}
 
     def execute_code(self, code: str) -> dict[str, Any]:
+        import traceback as tb_module
         output_buffer = io.StringIO()
         def task():
             try:
                 with contextlib.redirect_stdout(output_buffer):
-                    exec(code, globals())
+                    exec(code, globals())  # noqa: S102 - intentional code execution for FreeCAD scripting
                 FreeCAD.Console.PrintMessage("Python code executed successfully.\n")
+                self._recenter_viewport()
                 return True
             except Exception as e:
+                full_tb = tb_module.format_exc()
                 FreeCAD.Console.PrintError(
-                    f"Error executing Python code: {e}\n"
+                    f"Error executing Python code: {e}\n{full_tb}\n"
                 )
-                return f"Error executing Python code: {e}\n"
+                return f"Error: {e}\nTraceback:\n{full_tb}"
 
         rpc_request_queue.put(task)
         res = rpc_response_queue.get()
@@ -302,6 +305,85 @@ class FreeCADRPC:
                 "success": True,
                 "message": "Python code execution scheduled. \nOutput: " + output_buffer.getvalue()
             }
+        else:
+            return {"success": False, "error": res}
+
+    def save_document(self, doc_name: str, file_path: str = "") -> dict[str, Any]:
+        def task():
+            try:
+                doc = FreeCAD.getDocument(doc_name)
+                if not doc:
+                    return f"Document '{doc_name}' not found."
+                if file_path:
+                    doc.saveAs(file_path)
+                else:
+                    if doc.FileName:
+                        doc.save()
+                    else:
+                        return "No file path specified and document has never been saved. Provide a file_path."
+                return True
+            except Exception as e:
+                return str(e)
+
+        rpc_request_queue.put(task)
+        res = rpc_response_queue.get()
+        if res is True:
+            saved_path = file_path or FreeCAD.getDocument(doc_name).FileName
+            return {"success": True, "file_path": saved_path}
+        else:
+            return {"success": False, "error": res}
+
+    def export_document(self, doc_name: str, obj_names: list, file_path: str, file_format: str) -> dict[str, Any]:
+        def task():
+            try:
+                doc = FreeCAD.getDocument(doc_name)
+                if not doc:
+                    return f"Document '{doc_name}' not found."
+
+                objects = []
+                for name in obj_names:
+                    obj = doc.getObject(name)
+                    if not obj:
+                        return f"Object '{name}' not found in document '{doc_name}'."
+                    objects.append(obj)
+
+                import Part
+                if file_format.upper() in ("STEP", "STP"):
+                    Part.export(objects, file_path)
+                elif file_format.upper() == "STL":
+                    import Mesh
+                    Mesh.export(objects, file_path)
+                elif file_format.upper() in ("IGES", "IGS"):
+                    Part.export(objects, file_path)
+                else:
+                    return f"Unsupported format: {file_format}. Use STEP, STL, or IGES."
+
+                return True
+            except Exception as e:
+                return str(e)
+
+        rpc_request_queue.put(task)
+        res = rpc_response_queue.get()
+        if res is True:
+            return {"success": True, "file_path": file_path}
+        else:
+            return {"success": False, "error": res}
+
+    def recompute_document(self, doc_name: str) -> dict[str, Any]:
+        def task():
+            try:
+                doc = FreeCAD.getDocument(doc_name)
+                if not doc:
+                    return f"Document '{doc_name}' not found."
+                doc.recompute()
+                return True
+            except Exception as e:
+                return str(e)
+
+        rpc_request_queue.put(task)
+        res = rpc_response_queue.get()
+        if res is True:
+            return {"success": True}
         else:
             return {"success": False, "error": res}
 
@@ -326,6 +408,215 @@ class FreeCADRPC:
             return {"success": True, "message": "Part inserted from library."}
         else:
             return {"success": False, "error": res}
+
+    def inspect_geometry(self, doc_name: str, obj_name: str, what: str = "summary") -> dict[str, Any]:
+        def task():
+            try:
+                doc = FreeCAD.getDocument(doc_name)
+                if not doc:
+                    return {"success": False, "error": f"Document '{doc_name}' not found."}
+
+                obj = doc.getObject(obj_name)
+                if not obj:
+                    return {"success": False, "error": f"Object '{obj_name}' not found in '{doc_name}'."}
+
+                valid_modes = {"summary", "faces", "edges", "sketches", "feature_tree", "all"}
+                if what not in valid_modes:
+                    return {"success": False, "error": f"Invalid 'what' value: {what}. Must be one of {sorted(valid_modes)}"}
+
+                result = {}
+
+                if what in ("summary", "all"):
+                    result["summary"] = self._inspect_summary(obj)
+
+                if what in ("faces", "all"):
+                    result["faces"] = self._inspect_faces(obj)
+
+                if what in ("edges", "all"):
+                    result["edges"] = self._inspect_edges(obj)
+
+                if what in ("sketches", "all"):
+                    result["sketches"] = self._inspect_sketches(obj)
+
+                if what in ("feature_tree", "all"):
+                    result["feature_tree"] = self._inspect_feature_tree(obj)
+
+                # For single-mode queries, unwrap the dict
+                if what != "all" and what in result:
+                    result = result[what]
+
+                return {"success": True, "data": result}
+            except Exception as e:
+                import traceback as tb_module
+                return {"success": False, "error": f"{e}\n{tb_module.format_exc()}"}
+
+        rpc_request_queue.put(task)
+        return rpc_response_queue.get()
+
+    def _inspect_summary(self, obj) -> dict[str, Any]:
+        result = {
+            "name": obj.Name,
+            "label": obj.Label,
+            "type": obj.TypeId,
+            "valid": "Invalid" not in obj.State,
+        }
+        if hasattr(obj, "Shape") and obj.Shape:
+            shape = obj.Shape
+            bb = shape.BoundBox
+            result["bounding_box"] = {
+                "x": [round(bb.XMin, 4), round(bb.XMax, 4)],
+                "y": [round(bb.YMin, 4), round(bb.YMax, 4)],
+                "z": [round(bb.ZMin, 4), round(bb.ZMax, 4)],
+                "size": [round(bb.XLength, 4), round(bb.YLength, 4), round(bb.ZLength, 4)],
+            }
+            result["volume"] = round(shape.Volume, 4)
+            result["area"] = round(shape.Area, 4)
+            result["face_count"] = len(shape.Faces)
+            result["edge_count"] = len(shape.Edges)
+            result["vertex_count"] = len(shape.Vertexes)
+        return result
+
+    def _inspect_faces(self, obj) -> list[dict[str, Any]]:
+        if not hasattr(obj, "Shape") or not obj.Shape:
+            return []
+        faces = []
+        for i, face in enumerate(obj.Shape.Faces):
+            com = face.CenterOfMass
+            entry = {
+                "name": f"Face{i+1}",
+                "center": [round(com.x, 4), round(com.y, 4), round(com.z, 4)],
+                "area": round(face.Area, 4),
+            }
+            try:
+                axis = face.Surface.Axis
+                entry["normal"] = [round(axis.x, 4), round(axis.y, 4), round(axis.z, 4)]
+            except (AttributeError, RuntimeError):
+                # Surface types like BSpline/NURBS don't have a simple Axis
+                entry["normal"] = None
+            surface_type = type(face.Surface).__name__
+            entry["surface_type"] = surface_type
+            faces.append(entry)
+        return faces
+
+    def _inspect_edges(self, obj) -> list[dict[str, Any]]:
+        if not hasattr(obj, "Shape") or not obj.Shape:
+            return []
+        edges = []
+        for i, edge in enumerate(obj.Shape.Edges):
+            mid = edge.CenterOfMass
+            entry = {
+                "name": f"Edge{i+1}",
+                "midpoint": [round(mid.x, 4), round(mid.y, 4), round(mid.z, 4)],
+                "length": round(edge.Length, 4),
+                "type": type(edge.Curve).__name__,
+            }
+            edges.append(entry)
+        return edges
+
+    def _inspect_sketches(self, obj) -> dict[str, Any]:
+        if obj.TypeId != "Sketcher::SketchObject":
+            return {"error": f"'{obj.Name}' is not a sketch (type: {obj.TypeId})."}
+
+        result = {
+            "sketch_name": obj.Name,
+            "geometry_count": obj.GeometryCount,
+            "constraint_count": obj.ConstraintCount,
+            "fully_constrained": obj.FullyConstrained,
+            "geometry": [],
+        }
+
+        for i in range(obj.GeometryCount):
+            geo = obj.Geometry[i]
+            geo_type = type(geo).__name__
+            entry = {"index": i, "type": geo_type}
+
+            if geo_type == "Circle":
+                entry["center"] = [round(geo.Center.x, 4), round(geo.Center.y, 4)]
+                entry["radius"] = round(geo.Radius, 4)
+            elif geo_type == "LineSegment":
+                entry["start"] = [round(geo.StartPoint.x, 4), round(geo.StartPoint.y, 4)]
+                entry["end"] = [round(geo.EndPoint.x, 4), round(geo.EndPoint.y, 4)]
+            elif geo_type == "ArcOfCircle":
+                entry["center"] = [round(geo.Center.x, 4), round(geo.Center.y, 4)]
+                entry["radius"] = round(geo.Radius, 4)
+
+            result["geometry"].append(entry)
+
+        # Placement info
+        try:
+            p = obj.getGlobalPlacement()
+            rot = p.Rotation
+            ox = rot.multVec(FreeCAD.Vector(1, 0, 0))
+            oy = rot.multVec(FreeCAD.Vector(0, 1, 0))
+            oz = rot.multVec(FreeCAD.Vector(0, 0, 1))
+            result["placement"] = {
+                "origin": [round(p.Base.x, 4), round(p.Base.y, 4), round(p.Base.z, 4)],
+                "cx_maps_to": [round(ox.x, 4), round(ox.y, 4), round(ox.z, 4)],
+                "cy_maps_to": [round(oy.x, 4), round(oy.y, 4), round(oy.z, 4)],
+                "normal": [round(oz.x, 4), round(oz.y, 4), round(oz.z, 4)],
+            }
+        except Exception:
+            result["placement"] = None
+
+        return result
+
+    def _inspect_feature_tree(self, obj) -> list[dict[str, Any]]:
+        # If obj is a Body, iterate its Group; otherwise inspect just the object
+        if hasattr(obj, "Group"):
+            objects = obj.Group
+        else:
+            objects = [obj]
+
+        features = []
+        for feat in objects:
+            entry = {
+                "name": feat.Name,
+                "label": feat.Label,
+                "type": feat.TypeId,
+                "valid": "Invalid" not in feat.State,
+            }
+            # Add feature-specific properties (guarded against invalid state)
+            try:
+                if hasattr(feat, "Length") and feat.TypeId in (
+                    "PartDesign::Pad", "PartDesign::Pocket",
+                ):
+                    entry["length"] = round(feat.Length, 4)
+                if hasattr(feat, "Type") and feat.TypeId == "PartDesign::Pocket":
+                    entry["through_all"] = feat.Type == "ThroughAll"
+                if hasattr(feat, "Radius") and feat.TypeId in (
+                    "PartDesign::Fillet", "PartDesign::Chamfer",
+                ):
+                    entry["radius"] = round(feat.Radius, 4)
+                if feat.TypeId == "Sketcher::SketchObject":
+                    entry["geometry_count"] = feat.GeometryCount
+                    entry["constraint_count"] = feat.ConstraintCount
+                    entry["fully_constrained"] = feat.FullyConstrained
+            except (AttributeError, RuntimeError):
+                pass  # Feature in invalid state; basic info still returned
+            features.append(entry)
+
+        return features
+
+    def _recenter_viewport(self):
+        """Recenter the user's viewport: fit all objects and reset to isometric.
+        Called after geometry-changing operations so the user can see the result.
+        Fails silently if no 3D view is available (e.g. TechDraw/Spreadsheet).
+        Must be called from the GUI thread.
+        """
+        try:
+            if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
+                view = FreeCADGui.ActiveDocument.ActiveView
+                if hasattr(view, 'viewIsometric'):
+                    FreeCADGui.updateGui()  # flush pending view updates from recompute
+                    view.viewIsometric()
+                    view.fitAll()
+                    FreeCAD.Console.PrintMessage("Viewport recentered.\n")
+                else:
+                    FreeCAD.Console.PrintMessage("Viewport: no viewIsometric available.\n")
+            else:
+                FreeCAD.Console.PrintMessage("Viewport: no active document/view.\n")
+        except Exception as e:
+            FreeCAD.Console.PrintWarning(f"Viewport recenter failed: {e}\n")
 
     def list_documents(self):
         return list(FreeCAD.listDocuments().keys())
@@ -444,6 +735,7 @@ class FreeCADRPC:
                     )
  
                 doc.recompute()
+                self._recenter_viewport()
                 return True
             except Exception as e:
                 return str(e)
@@ -480,6 +772,7 @@ class FreeCADRPC:
                 del obj.properties["References"]
             set_object_property(doc, obj_ins, obj.properties)
             doc.recompute()
+            self._recenter_viewport()
             FreeCAD.Console.PrintMessage(f"Object '{obj.name}' updated via RPC.\n")
             return True
         except Exception as e:
@@ -494,6 +787,7 @@ class FreeCADRPC:
         try:
             doc.removeObject(obj_name)
             doc.recompute()
+            self._recenter_viewport()
             FreeCAD.Console.PrintMessage(f"Object '{obj_name}' deleted via RPC.\n")
             return True
         except Exception as e:
